@@ -1,0 +1,14 @@
+services:
+  ahrefs-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Needed for the 12 free-tool endpoints (Domain Rating, backlinks,
+      # traffic, keywords, AI visibility ...). Overview, competitors and the
+      # website rankings work without it.
+      # - CAPSOLVER_API_KEY=CAP-...
+      # Optional — Ahrefs serves direct connections, so leave this unset.
+      # - AHREFS_PROXY=http://user:pass@host:port
