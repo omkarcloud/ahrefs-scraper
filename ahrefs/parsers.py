@@ -27,11 +27,14 @@ lists, youtube.com's and bulbagarden.net's website pages, youtube.com's
 competitors page and the ahrefstop 404 page.
 """
 import json
+import fastjson
 import re
 
 from bs4 import BeautifulSoup
 
 from ahrefs import refs
+from scraper_utils.values import as_dict as _dict, as_list as _list, num as _float, to_int as _int
+from scraper_utils.text import squashed_any as _clean
 
 CURRENCY = "USD"
 
@@ -49,13 +52,6 @@ _BLOB_RE = re.compile(r"window\.AhrefsTop\.(\w+)\s*=\s*(\{.*?\});\s*(?:\n|</scri
 
 def _text(node, sep=" "):
     return node.get_text(sep, strip=True) if node is not None else ""
-
-
-def _clean(value):
-    if value is None:
-        return None
-    value = " ".join(str(value).split())
-    return value or None
 
 
 def parse_compact(value):
@@ -129,28 +125,6 @@ def _model_name(value):
     if not isinstance(token, str):
         return None
     return refs.AI_MODELS.get(token) or re.sub(r"(?<!^)(?=[A-Z])", "_", token).lower()
-
-
-def _int(value):
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _float(value):
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _list(value):
-    return value if isinstance(value, list) else []
-
-
-def _dict(value):
-    return value if isinstance(value, dict) else {}
 
 
 def _link(value):
@@ -485,7 +459,7 @@ def _blobs(html):
     for name, body in _BLOB_RE.findall(html or ""):
         fixed = re.sub(r"([{,]\s*)([A-Za-z_]\w*)\s*:", r'\1"\2":', body)
         try:
-            out[name] = json.loads(fixed)
+            out[name] = fastjson.loads(fixed)
         except ValueError:
             continue
     return out
@@ -686,7 +660,7 @@ def parse_website(html, domain=None):
     updated = None
     for script in soup.select("script[type='application/ld+json']"):
         try:
-            updated = _iso_date(_dict(json.loads(script.string or "")).get("dateModified"))
+            updated = _iso_date(_dict(fastjson.loads(script.string or "")).get("dateModified"))
         except ValueError:
             continue
         if updated:

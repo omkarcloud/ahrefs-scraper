@@ -2,7 +2,11 @@
 browser, no cookies. Two upstream hosts, both open to curl (every surface
 200 from a home connection and from datacenter and residential proxy exits
 with chrome / safari17_0 impersonation, 2026-11-03; the egress tier is set
-by the "ahrefs" knob in config.py, AHREFS_EXIT).
+by the "ahrefs" knob in config.py, AHREFS_EXIT: the pod's own IP). A 403 /
+429 / challenge page there moves new sessions to AHREFS_FALLBACK_EXIT for
+AHREFS_BLOCK_HOLD_S — the shared gateway exit (2026-11-11: a fresh gateway
+address per request, 22/22 Turnstile tokens honoured through it) — and the
+last retry of a call the gateway also failed rides a datacenter exit.
 
   * FREE-TOOL RPCs  https://ahrefs.com/v4/<name>: JSON in, `["Ok", {...}]`
     or `["Error", ["InvalidCaptcha" | "InvalidUrl" | "InvalidInput", msg]]`
@@ -23,6 +27,7 @@ by the "ahrefs" knob in config.py, AHREFS_EXIT).
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   AhrefsUpstreamError  transport failure / 5xx / odd body       — retryable
   AhrefsBlocked        403 / 429 / challenge / InvalidCaptcha   — retryable
+                       (AhrefsRefused = the first three: the exit, not the token)
   AhrefsBadRequest     InvalidUrl / InvalidInput                — never retried
   AhrefsNotFound       ahrefstop 404, keyword with no SERP data — never retried
 """
@@ -40,6 +45,8 @@ import config
 import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from ahrefs.refs import RPC_BASE, SITE, TOP_SITE
+from scraper_utils.pages import page_title as _page_title
+from scraper_utils import sessions
 
 IMPERSONATE = "chrome"
 RPC_TIMEOUT = 60      # the sitemap generator crawls up to 1000 URLs
@@ -73,6 +80,11 @@ class AhrefsBlocked(AhrefsUpstreamError, Blocked):
     """403 / 429 / challenge page, or a captcha token Ahrefs refused — retryable."""
 
 
+class AhrefsRefused(AhrefsBlocked):
+    """403 / 429 / challenge page: the EXIT was refused (not a captcha
+    token) — retryable, and on the pod's own IP it starts the block hold."""
+
+
 class AhrefsBadRequest(BadRequest):
     """Ahrefs rejected the input (InvalidUrl / InvalidInput) — never retried."""
 
@@ -88,45 +100,80 @@ class AhrefsCaptchaNotConfigured(RuntimeError):
 
 # One session per cheroot worker thread: a curl handle must not be shared
 # across threads; one sticky exit per session, dropped on a retryable failure.
+# Per thread too: `on_hold_tier` = the session was built on the block tier,
+# `attempt_exit` = the exit the current attempt's request rode, `last_resort`
+# = this attempt is the last retry of a call the gateway failed.
 _local = threading.local()
+_hold_lock = threading.Lock()
+_hold_until = 0.0     # new sessions ride the block tier (the gateway exit) until this time (after an exit refusal)
+_NO_REQUEST = object()
+
+
+def _note_block():
+    global _hold_until
+    with _hold_lock:
+        _hold_until = max(_hold_until, time.monotonic() + config.AHREFS_BLOCK_HOLD_S)
 
 
 def _session():
     sess = getattr(_local, "session", None)
+    if sess is not None and getattr(_local, "on_hold_tier", False) and time.monotonic() >= _hold_until:
+        _drop_session()         # the hold is over: back to the configured exit
+        sess = None
     if sess is None:
-        from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
         proxy = config.ahrefs_proxy()
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
+        held = proxy is None and time.monotonic() < _hold_until
+        if getattr(_local, "last_resort", False):
+            held, proxy = False, config.ahrefs_block_proxy(last=True)
+        elif held:
+            proxy = config.ahrefs_block_proxy()
+        sess = egress.new_session(proxy, impersonate=IMPERSONATE)     # None, a proxy URL, or the gateway exit ("gateway")
         sess.headers["accept-language"] = egress.accept_language(proxy)
         _local.session = sess
+        _local.proxy = proxy
+        _local.on_hold_tier = held
+    _local.attempt_exit = getattr(_local, "proxy", None)
     return sess
 
 
 def _drop_session():
     sess = getattr(_local, "session", None)
     _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    _local.proxy = None
+    _local.on_hold_tier = False
+    sessions.close_quietly(sess)
 
 
 def _retrying(fn):
     """Run fn() under the shared retry policy (AhrefsUpstreamError only;
-    NotFound / BadRequest surface immediately)."""
+    NotFound / BadRequest surface immediately). An exit refusal
+    (AhrefsRefused) on the pod's own IP starts the hold that moves new
+    sessions to the block tier (the gateway exit). When the attempt before
+    the last one failed on the gateway (a refusal or a transport failure
+    such as its 29 s limit, not a captcha token), the last retry rides a
+    datacenter exit."""
     last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except AhrefsUpstreamError as e:
-            last = e
-            _drop_session()
-            if attempt < config.MAX_RETRIES:
-                time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    try:
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            _local.attempt_exit = _NO_REQUEST
+            try:
+                return fn()
+            except AhrefsUpstreamError as e:
+                last = e
+                rode = getattr(_local, "attempt_exit", _NO_REQUEST)     # _NO_REQUEST: the captcha mint failed first
+                _drop_session()
+                if isinstance(e, AhrefsRefused) and rode is None:
+                    _note_block()
+                if attempt < config.MAX_RETRIES:
+                    captcha_only = rode is _NO_REQUEST or (isinstance(e, AhrefsBlocked) and not isinstance(e, AhrefsRefused))
+                    _local.last_resort = (attempt + 1 == config.MAX_RETRIES and not captcha_only
+                                          and bool(config.gateway_exit(rode)))     # the session _session() builds next
+                    time.sleep(config.RETRY_BACKOFF * attempt)
+        raise last
+    finally:
+        if getattr(_local, "last_resort", False):
+            _local.last_resort = False
+            _drop_session()         # the next call starts on the tier of the moment again
 
 
 # ---- Turnstile tokens (CapSolver) --------------------------------------------
@@ -180,7 +227,7 @@ def _decode_rpc(resp, name, ok_tags=("Ok",)):
     `["TopBacklinks", {...}]`, its reportType)."""
     status = resp.status_code
     if status in (401, 403, 429):
-        raise AhrefsBlocked(f"HTTP {status} for {name}")
+        raise AhrefsRefused(f"HTTP {status} for {name}")
     if status >= 500:
         raise AhrefsUpstreamError(f"HTTP {status} for {name}")
     try:
@@ -188,7 +235,7 @@ def _decode_rpc(resp, name, ok_tags=("Ok",)):
     except Exception:
         head = (resp.text or "")[:200]
         if any(m in head.lower() for m in _BLOCK_MARKERS):
-            raise AhrefsBlocked(f"challenge page for {name}")
+            raise AhrefsRefused(f"challenge page for {name}")
         raise AhrefsUpstreamError(f"non-JSON reply for {name}: {head}")
     if not isinstance(envelope, list) or not envelope:
         raise AhrefsUpstreamError(f"unexpected reply shape for {name}: {str(envelope)[:200]}")
@@ -303,10 +350,6 @@ def ai_mode(brand):
 
 # ---- ahrefstop.com pages -----------------------------------------------------
 
-def _page_title(text):
-    match = _TITLE_RE.search(text or "")
-    return match.group(1).strip() if match else ""
-
 
 def top_page(path, label):
     """GET one ahrefstop.com page; 404 -> AhrefsNotFound."""
@@ -318,7 +361,7 @@ def top_page(path, label):
         if resp.status_code == 404:
             raise AhrefsNotFound(f"{label} not found")
         if resp.status_code in (401, 403, 429):
-            raise AhrefsBlocked(f"HTTP {resp.status_code} for {label}")
+            raise AhrefsRefused(f"HTTP {resp.status_code} for {label}")
         if resp.status_code != 200:
             raise AhrefsUpstreamError(f"HTTP {resp.status_code} for {label}")
         text = resp.text
@@ -326,7 +369,7 @@ def top_page(path, label):
         if title.startswith("404"):
             raise AhrefsNotFound(f"{label} not found")
         if any(m in text[:3000].lower() for m in _BLOCK_MARKERS):
-            raise AhrefsBlocked(f"challenge page for {label}")
+            raise AhrefsRefused(f"challenge page for {label}")
         return text
     return _retrying(once)
 

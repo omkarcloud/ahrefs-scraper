@@ -51,3 +51,14 @@ AHREFS_PROXY = os.environ.get("AHREFS_PROXY") or None
 def ahrefs_proxy():
     """The proxy for one session (None = direct)."""
     return os.environ.get("AHREFS_PROXY") or None
+
+
+# ---- added by the sync: defaults for a direct run ----
+AHREFS_BLOCK_HOLD_S = 600
+def ahrefs_block_proxy(*args, **kwargs):
+    return None
+
+
+def gateway_exit(exit=None):
+    return None
+
